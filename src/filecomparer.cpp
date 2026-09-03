@@ -1,4 +1,4 @@
-#include "FileComparer.hpp"
+#include "filecomparer.hpp"
 #include <iostream>
 #include <fstream>
 #include <algorithm>
