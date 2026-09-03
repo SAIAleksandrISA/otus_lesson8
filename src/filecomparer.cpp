@@ -4,147 +4,224 @@
 #include <algorithm>
 #include <vector>
 #include <map>
-#include <limits>
+#include <list>
+#include <memory>
 
 struct FileStreamInfo
 {
     boost::filesystem::path m_path;
     std::ifstream m_stream;
-    bool m_is_candidate_for_duplicate = true;
-    bool m_reached_eof = false; 
+    bool m_is_candidate_for_duplicate;
+    bool m_reached_eof;
+    uint64_t m_last_block_hash;
+
+    FileStreamInfo(const boost::filesystem::path& p, std::ifstream&& stream)
+        : m_path(p), m_stream(std::move(stream)), m_is_candidate_for_duplicate(true), m_reached_eof(false), m_last_block_hash(0) {
+    }
+
+    FileStreamInfo(FileStreamInfo&& other) noexcept = default;
+    FileStreamInfo& operator=(FileStreamInfo&& other) noexcept = default;
+
+    FileStreamInfo(const FileStreamInfo&) = delete;
+    FileStreamInfo& operator=(const FileStreamInfo&) = delete;
+};
+
+struct DuplicateGroup
+{
+    std::list<FileStreamInfo> m_files;
+    bool m_is_resolved;
+
+    DuplicateGroup(std::list<FileStreamInfo>&& files)
+        : m_files(std::move(files)), m_is_resolved(false) {
+    }
+
+    DuplicateGroup(DuplicateGroup&& other) noexcept = default;
+    DuplicateGroup& operator=(DuplicateGroup&& other) noexcept = default;
+
+    DuplicateGroup(const DuplicateGroup&) = delete;
+    DuplicateGroup& operator=(const DuplicateGroup&) = delete;
 };
 
 FileComparer::FileComparer(const Options& options)
-    : m_options(options), m_hasher(options.m_block_size, options.m_hash_algo) {
+    : m_options(options), m_hasher(options.m_block_size, options.m_hash_algo)
+{
 }
 
 void FileComparer::findAndPrintDuplicates(const std::vector<FileInfo>& files)
 {
     auto sizeGroups = groupBySize(files);
-    for (auto& [size, paths] : sizeGroups) 
+
+    for (auto const& pair : sizeGroups)
     {
-        if (paths.size() < 2) continue;
+        const std::vector<boost::filesystem::path>& paths = pair.second;
 
-        std::vector<FileStreamInfo> file_stream_infos;
-        file_stream_infos.reserve(paths.size());
-        for (const auto& p : paths)
-            file_stream_infos.push_back({ p, std::ifstream(p.c_str(), std::ios::binary), true });
-
-        while (true)
+        if (paths.size() < 2)
         {
-            bool progress_made_in_round = false;
-            std::map<uint64_t, std::vector<size_t>> hash_to_candidate_indices;
-            std::vector<size_t> files_that_ended_this_round; 
+            continue;
+        }
 
-            for (size_t i = 0; i < file_stream_infos.size(); ++i)
+        std::list<FileStreamInfo> initial_file_list;
+        for (const auto& p : paths)
+        {
+            std::ifstream stream(p.c_str(), std::ios::binary);
+            if (!stream.is_open())
             {
-                if (!file_stream_infos[i].m_is_candidate_for_duplicate || file_stream_infos[i].m_reached_eof)
+                continue;
+            }
+            initial_file_list.emplace_back(p, std::move(stream));
+        }
+
+        if (initial_file_list.size() < 2)
+        {
+            continue;
+        }
+
+        std::vector<DuplicateGroup> active_groups;
+        active_groups.emplace_back(std::move(initial_file_list));
+
+        std::vector<DuplicateGroup> final_results;
+
+        while (!active_groups.empty())
+        {
+            std::vector<DuplicateGroup> next_round_groups;
+            bool any_progress_this_round = false;
+
+            for (auto& current_group : active_groups)
+            {
+                if (current_group.m_is_resolved)
                 {
                     continue;
                 }
 
-                if (file_stream_infos[i].m_stream.eof() || file_stream_infos[i].m_stream.fail())
+                std::map<uint64_t, std::list<FileStreamInfo>> partition_map;
+                std::list<FileStreamInfo> files_that_ended_this_round_in_group;
+                bool group_made_progress = false;
+
+                auto it = current_group.m_files.begin();
+                while (it != current_group.m_files.end())
                 {
-                    file_stream_infos[i].m_reached_eof = true;
-                    continue;
-                }
+                    FileStreamInfo& fsi = *it;
 
-                uint64_t h = m_hasher.hashNextBlock(file_stream_infos[i].m_stream);
-
-                bool stream_now_eof = file_stream_infos[i].m_stream.eof() || file_stream_infos[i].m_stream.fail();
-
-                if (h != 0 || !stream_now_eof)
-                {
-                    hash_to_candidate_indices[h].push_back(i);
-                    progress_made_in_round = true;
-                }
-                else
-                {
-                    file_stream_infos[i].m_reached_eof = true;
-                    files_that_ended_this_round.push_back(i);
-                    progress_made_in_round = true;
-                }
-            }
-
-            if (!progress_made_in_round)
-            {
-                break;
-            }
-            for (auto& fsi : file_stream_infos)
-            {
-                fsi.m_is_candidate_for_duplicate = false;
-            }
-
-            bool any_candidates_remain_for_next_round = false;
-
-            for (const auto& pair : hash_to_candidate_indices)
-            {
-                const std::vector<size_t>& current_indices = pair.second;
-
-                if (current_indices.size() > 1)
-                {
-                    bool all_files_in_group_ended = true;
-                    for (size_t original_idx : current_indices)
+                    if (!fsi.m_is_candidate_for_duplicate || fsi.m_reached_eof)
                     {
-                        if (!file_stream_infos[original_idx].m_reached_eof)
-                        {
-                            all_files_in_group_ended = false;
-                            break;
-                        }
+                        it = current_group.m_files.erase(it);
+                        continue;
                     }
 
-                    if (all_files_in_group_ended)
+                    if (fsi.m_stream.eof() || fsi.m_stream.fail())
                     {
-                        for (size_t original_idx : current_indices)
-                        {
-                            file_stream_infos[original_idx].m_is_candidate_for_duplicate = true;
-                            any_candidates_remain_for_next_round = true;
-                        }
+                        fsi.m_reached_eof = true;
+                        files_that_ended_this_round_in_group.push_back(std::move(*it));
+                        it = current_group.m_files.erase(it);
+                        group_made_progress = true;
+                        continue;
+                    }
+
+                    uint64_t h = m_hasher.hashNextBlock(fsi.m_stream);
+                    bool stream_now_eof = fsi.m_stream.eof() || fsi.m_stream.fail();
+
+                    if (h != 0 || !stream_now_eof)
+                    {
+                        fsi.m_last_block_hash = h;
+                        partition_map[h].push_back(std::move(*it));
+                        it = current_group.m_files.erase(it);
+                        group_made_progress = true;
                     }
                     else
                     {
-                        for (size_t original_idx : current_indices) // Используем current_indices
+                        fsi.m_reached_eof = true;
+                        fsi.m_last_block_hash = h;
+                        files_that_ended_this_round_in_group.push_back(std::move(*it));
+                        it = current_group.m_files.erase(it);
+                        group_made_progress = true;
+                    }
+                }
+
+                if (!group_made_progress && !current_group.m_files.empty())
+                {
+                    int active_candidates_count = 0;
+                    for (const auto& fsi : current_group.m_files)
+                    {
+                        if (fsi.m_is_candidate_for_duplicate && !fsi.m_reached_eof)
                         {
-                            if (!file_stream_infos[original_idx].m_reached_eof)
+                            active_candidates_count++;
+                        }
+                    }
+                    if (active_candidates_count <= 1)
+                    {
+                        current_group.m_is_resolved = true;
+                    }
+                    continue;
+                }
+
+                if (group_made_progress)
+                {
+                    any_progress_this_round = true;
+                }
+
+                for (auto& fsi : files_that_ended_this_round_in_group)
+                {
+                    partition_map[fsi.m_last_block_hash].push_back(std::move(fsi));
+                }
+
+                for (auto& part_pair : partition_map)
+                {
+                    std::list<FileStreamInfo>& partitioned_files_list = part_pair.second;
+
+                    if (partitioned_files_list.size() > 1)
+                    {
+                        bool all_partition_files_ended_eof = true;
+                        for (const auto& fsi : partitioned_files_list)
+                        {
+                            if (!fsi.m_reached_eof)
                             {
-                                file_stream_infos[original_idx].m_is_candidate_for_duplicate = true;
-                                any_candidates_remain_for_next_round = true;
+                                all_partition_files_ended_eof = false;
+                                break;
+                            }
+                        }
+
+                        if (all_partition_files_ended_eof)
+                        {
+                            DuplicateGroup resolved_group(std::move(partitioned_files_list));
+                            resolved_group.m_is_resolved = true;
+                            final_results.push_back(std::move(resolved_group));
+                        }
+                        else
+                        {
+                            std::list<FileStreamInfo> continuing_candidate_files;
+                            for (auto& fsi : partitioned_files_list)
+                            {
+                                if (!fsi.m_reached_eof)
+                                {
+                                    continuing_candidate_files.push_back(std::move(fsi));
+                                }
+                            }
+                            if (continuing_candidate_files.size() > 1)
+                            {
+                                next_round_groups.emplace_back(std::move(continuing_candidate_files));
                             }
                         }
                     }
                 }
             }
-            if (!any_candidates_remain_for_next_round)
+
+            active_groups = std::move(next_round_groups);
+            if (!any_progress_this_round)
             {
-                break;
-            }
-        } 
-
-        std::vector<boost::filesystem::path> dups;
-
-        bool all_files_in_this_size_group_ended = true;
-        for (const auto& fsi : file_stream_infos) {
-            if (!fsi.m_reached_eof) {
-                all_files_in_this_size_group_ended = false;
                 break;
             }
         }
 
-        if (all_files_in_this_size_group_ended)
+        for (const auto& group : final_results)
         {
-            for (size_t i = 0; i < file_stream_infos.size(); ++i)
+            if (group.m_is_resolved && group.m_files.size() > 1)
             {
-                if (file_stream_infos[i].m_is_candidate_for_duplicate)
+                for (const auto& fsi : group.m_files)
                 {
-                    dups.push_back(file_stream_infos[i].m_path);
+                    std::cout << fsi.m_path.string() << std::endl;
                 }
+                std::cout << std::endl;
             }
-        }
-
-        if (dups.size() > 1)
-        {
-            for (const auto& p : dups) std::cout << p.string() << std::endl;
-            std::cout << std::endl;
         }
     }
 }
@@ -152,6 +229,9 @@ void FileComparer::findAndPrintDuplicates(const std::vector<FileInfo>& files)
 std::map<uintmax_t, std::vector<boost::filesystem::path>> FileComparer::groupBySize(const std::vector<FileInfo>& files) const
 {
     std::map<uintmax_t, std::vector<boost::filesystem::path>> groups;
-    for (const auto& f : files) groups[f.m_size].push_back(f.m_path);
+    for (const auto& f : files)
+    {
+        groups[f.m_size].push_back(f.m_path);
+    }
     return groups;
 }
