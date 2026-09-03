@@ -15,13 +15,14 @@ int main(int argc, char* argv[])
     po::options_description desc("Allowed options");
     desc.add_options()
         ("help,h", "Produce help")
-        ("directories,d", po::value<std::vector<fs::path>>(&options.m_directories)->multitoken(), "Dirs")
-        ("exclude,e", po::value<std::vector<fs::path>>(&options.m_exclude_dirs)->multitoken(), "Exclude")
-        ("level,l", po::value<int>(&options.m_scan_level)->default_value(-1), "Level")
-        ("min-size,s", po::value<uintmax_t>(&options.m_min_file_size)->default_value(1), "Min size")
-        ("mask,m", po::value<std::vector<std::string>>(&options.m_filename_masks)->multitoken(), "Mask")
-        ("block-size,S", po::value<size_t>(&options.m_block_size)->default_value(4096), "Block size")
-        ("hash-algo,H", po::value<std::string>(&options.m_hash_algo)->default_value("crc32"), "Algo");
+        ("directories,d", po::value<std::vector<fs::path>>(&options.m_directories)->multitoken(), "Directories to scan")
+        ("exclude,e", po::value<std::vector<fs::path>>(&options.m_exclude_dirs)->multitoken(), "Directories to exclude")
+        ("level,l", po::value<int>(&options.m_scan_level)->default_value(-1), "Scan depth level")
+        ("min-size,s", po::value<uintmax_t>(&options.m_min_file_size)->default_value(1), "Minimum file size in bytes")
+        ("mask,m", po::value<std::vector<std::string>>(&options.m_filename_masks)->multitoken(), "Filename mask")
+        ("block-size,S", po::value<size_t>(&options.m_block_size)->default_value(4096), "Block size for hashing")
+        ("hash-algo,H", po::value<std::string>(&options.m_hash_algo)->default_value("crc32"), "Hash algorithm (supported: crc32, crc16)")
+        ;
 
     po::variables_map vm;
     try
@@ -29,7 +30,17 @@ int main(int argc, char* argv[])
         po::store(po::parse_command_line(argc, argv, desc), vm);
         po::notify(vm);
     }
-    catch (...) { return 1; }
+    catch (const std::exception& e)
+    {
+        std::cerr << "Error parsing command line: " << e.what() << std::endl;
+        return 1;
+    }
+    catch (...)
+    {
+        std::cerr << "An unknown error occurred during command line parsing." << std::endl;
+        return 1;
+    }
+
 
     if (vm.count("help") || options.m_directories.empty())
     {
@@ -37,9 +48,22 @@ int main(int argc, char* argv[])
         return 0;
     }
 
-    FileScanner scanner(options);
-    FileComparer comparer(options);
-    comparer.findAndPrintDuplicates(scanner.scan());
+    try
+    {
+        FileScanner scanner(options);
+        FileComparer comparer(options);
+        comparer.findAndPrintDuplicates(scanner.scan());
+    }
+    catch (const std::runtime_error& e)
+    {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
+    catch (...)
+    {
+        std::cerr << "An unexpected error occurred during processing." << std::endl;
+        return 1;
+    }
 
     return 0;
 }
